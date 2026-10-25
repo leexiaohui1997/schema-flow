@@ -1,0 +1,21 @@
+#!/usr/bin/env sh
+. "$(dirname -- "$0")/_/husky.sh"
+
+# 启用严格模式：任何命令失败都会立即退出
+set -e
+
+# 数据库校验与格式化（确保 Prisma schema 与迁移一致）
+echo "🗄️ 校验并格式化数据库 schema..."
+pnpm run db:validate
+pnpm run db:format
+git add prisma/schema.prisma
+
+# 类型检查
+echo "🔍 运行 TypeScript 类型检查..."
+pnpm run typecheck
+
+# 代码检查和格式化
+echo "✨ 运行 lint-staged..."
+npx lint-staged
+
+echo "✅ Pre-commit 检查通过！"

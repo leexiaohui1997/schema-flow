@@ -1,0 +1,69 @@
+// SchemaFlow 元数据层
+// 阶段一：projects / tables / fields 三张核心元数据表
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Project {
+  id        Int      @id @default(autoincrement())
+  projectId String   @unique @db.VarChar(64)
+  name      String   @db.VarChar(128)
+  dbType    String   @db.VarChar(32) // mysql / postgresql / mongodb / es ...
+  dbConfig  Json // { host, port, user, password, database, ... }
+  status    Boolean  @default(true) // false=软删/禁用
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tables Table[]
+
+  @@map("projects")
+}
+
+model Table {
+  id             Int      @id @default(autoincrement())
+  projectId      String   @db.VarChar(64)
+  tableName      String   @db.VarChar(64) // 物理表名，创建后只读
+  displayName    String   @db.VarChar(128)
+  description    String?
+  securityConfig Json     @default("{}")
+  viewConfig     Json     @default("{}")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [projectId], onDelete: Cascade)
+  fields  Field[]
+
+  @@unique([projectId, tableName])
+  @@map("tables")
+}
+
+model Field {
+  id                 Int      @id @default(autoincrement())
+  tableId            Int
+  fieldKey           String   @db.VarChar(64) // 物理列名，创建后只读
+  displayName        String   @db.VarChar(128)
+  fieldType          String   @db.VarChar(32) // text/number/boolean/date/datetime/select/multiselect/json/richtext/file/password/email/url
+  isPrimary          Boolean  @default(false)
+  primaryKeyStrategy String?  @db.VarChar(32) // auto_increment / custom / uuid，仅主键字段有值
+  isRequired         Boolean  @default(false)
+  isUnique           Boolean  @default(false)
+  isReadonly         Boolean  @default(false)
+  lengthLimit        Int?
+  regex              String?  @db.VarChar(256)
+  defaultValue       String?  @db.VarChar(256)
+  options            Json? // select/multiselect 选项数组
+  sortOrder          Int      @default(0)
+  extraConfig        Json     @default("{}")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  table Table @relation(fields: [tableId], references: [id], onDelete: Cascade)
+
+  @@unique([tableId, fieldKey])
+  @@map("fields")
+}
