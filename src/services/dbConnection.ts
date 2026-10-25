@@ -26,7 +26,11 @@ export async function getDbClient(projectId: string): Promise<Pool> {
     database: string
   }
   const pool = new Pool({
-    connectionString: `postgresql://${cfg.user}:${cfg.password}@${cfg.host}:${cfg.port}/${cfg.database}`,
+    host: cfg.host,
+    port: cfg.port,
+    user: cfg.user,
+    password: cfg.password,
+    database: cfg.database,
     max: 5,
     idleTimeoutMillis: 30_000,
   })

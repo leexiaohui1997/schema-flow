@@ -65,12 +65,30 @@ export function validateData(
       case 'email':
       case 'url':
       case 'select':
-      case 'multiselect':
         if (typeof value !== 'string') {
           errors.push({
             field: f.fieldKey,
             message: `${f.displayName || f.fieldKey} must be a string`,
           })
+        }
+        break
+      case 'multiselect':
+        if (!Array.isArray(value) || value.some((v) => typeof v !== 'string')) {
+          errors.push({
+            field: f.fieldKey,
+            message: `${f.displayName || f.fieldKey} must be an array of strings`,
+          })
+          break
+        }
+        if (Array.isArray(f.options)) {
+          const allowed = (f.options as unknown[]).map(String)
+          const invalid = (value as string[]).filter((v) => !allowed.includes(v))
+          if (invalid.length > 0) {
+            errors.push({
+              field: f.fieldKey,
+              message: `${f.displayName || f.fieldKey} contains invalid options: ${invalid.join(', ')}`,
+            })
+          }
         }
         break
     }

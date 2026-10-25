@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid'
 import { prisma } from '../prisma.js'
 import { createProjectSchema, updateProjectSchema } from '../schemas.js'
 import { serializeDbConfig, deserializeDbConfig } from '../services/dbConfig.js'
+import { closeDbClient } from '../services/dbConnection.js'
 import { audit } from '../utils/audit.js'
 import { ok, created, fail } from '../utils/respond.js'
 
@@ -78,6 +79,12 @@ router.put('/:projectId', async (req: Request, res: Response, next: NextFunction
       where: { projectId: req.params.projectId as string },
       data,
     })
+
+    // dbConfig 变了就关掉旧连接池，下次请求重建
+    if (body.dbConfig !== undefined) {
+      await closeDbClient(req.params.projectId as string)
+    }
+
     audit({
       action: 'project.update',
       projectId: req.params.projectId as string,
