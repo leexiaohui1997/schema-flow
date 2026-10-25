@@ -1,6 +1,3 @@
-#!/usr/bin/env sh
-. "$(dirname -- "$0")/_/husky.sh"
-
 # 启用严格模式：任何命令失败都会立即退出
 set -e
 
