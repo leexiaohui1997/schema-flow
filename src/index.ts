@@ -3,6 +3,7 @@ import { z } from 'zod'
 
 import { env } from './env.js'
 import { authMiddleware } from './middleware/auth.js'
+import dataRouter from './routes/data.js'
 import fieldsRouter from './routes/fields.js'
 import projectsRouter from './routes/projects.js'
 import tablesRouter from './routes/tables.js'
@@ -22,6 +23,7 @@ app.use('/api', authMiddleware)
 app.use('/api/projects', projectsRouter)
 app.use('/api/projects/:projectId/tables', tablesRouter)
 app.use('/api/projects/:projectId/tables/:tableName/fields', fieldsRouter)
+app.use('/api/projects/:projectId/tables/:tableName/data', dataRouter)
 
 // 404
 app.use((_req: Request, res: Response) => fail(res, 404, 'not found'))

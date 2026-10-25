@@ -298,23 +298,222 @@ npx prisma migrate dev --name init
 
 ## 阶段2：动态CRUD接口
 
-**要做的事：**
+> 阶段一已完成元数据CRUD，阶段二做业务数据的动态CRUD。基于现有代码结构（Express 5 + Prisma 7 + PostgreSQL）开发。
 
-1. 写一个动态查询引擎，根据表名和字段元数据，自动生成 list/get/create/update/delete 接口
-2. 支持条件过滤（where）、分页（page/size）、排序（sort）
-3. 做基础的字段校验（必填、长度限制）
+### 现有代码基础（阶段一已搭好，直接复用）
 
-> 注：此阶段开发时手动先建一张测试表，引擎针对已有表做。
+- `src/middleware/auth.ts` — 占位鉴权中间件
+- `src/utils/respond.ts` — 统一响应包装（ok/created/fail）
+- `src/utils/audit.ts` — 审计日志（JSON 打 stdout）
+- `src/services/dbConfig.ts` — dbConfig 存取封装（未来加密只改这里）
+- `src/routes/tables.ts` 里的 `loadProject` 函数 — 检查项目存在且启用
 
-**收获：**
+### 新增文件清单
 
-- 给定一张已存在的表，自动获得一套完整的RESTful CRUD接口，不用手写每个表的后端
+| 文件 | 职责 |
+|---|---|
+| `src/services/dbConnection.ts` | 数据库连接管理器，根据 dbConfig 建立并缓存连接 |
+| `src/services/queryParser.ts` | 查询DSL解析器，把 where/sort/page/size 转成条件对象 |
+| `src/services/validator.ts` | 字段校验引擎，根据元数据校验写入数据 |
+| `src/routes/data.ts` | 动态CRUD路由（list/get/create/update/delete） |
 
-**验收标准：**
+---
 
-- 调 `/api/:project/:table/list` 能正确返回数据列表
-- 调 create/update/delete 能正确写入和修改数据
-- 带where条件、分页参数时能正确过滤
+### 任务1：DB连接管理器
+
+**新建文件：`src/services/dbConnection.ts`**
+
+要做什么：
+- 导出 `getDbClient(projectId)` 函数：根据 projectId 查项目的 dbConfig，建立 PostgreSQL 连接
+- 用 Map 缓存连接实例，同一个项目复用
+- 导出 `closeDbClient(projectId)` 函数：项目配置变更时重建连接
+- 技术选型：用 `pg`（node-postgres），不用 Prisma——因为业务表是动态的，Prisma 是静态建模的，动态表用 raw SQL 更灵活
+
+**为什么做：** 阶段一只是存了 dbConfig，从来没真正连过业务数据库。阶段二要操作业务数据，第一步就是能连上。
+
+---
+
+### 任务2：查询DSL解析器
+
+**新建文件：`src/services/queryParser.ts`**
+
+要做什么：
+- 解析 query 参数：`where`、`sort`、`page`、`size`
+- where 支持操作符：`=`, `>`, `<`, `>=`, `<=`, `!=`, `like`
+- sort 格式：`field:asc` / `field:desc`
+- 返回结构化条件对象：
+```ts
+{
+  where: Array<{ field: string, op: string, value: any }>,
+  sort: Array<{ field: string, order: 'asc' | 'desc' }>,
+  page: number,
+  size: number,
+}
+```
+
+**为什么做：** 前端传参格式五花八门，需要一个统一的解析层，把 query string 转成后端能处理的条件对象。
+
+---
+
+### 任务3：字段校验引擎
+
+**新建文件：`src/services/validator.ts`**
+
+要做什么：
+- 导出 `validateData(table, fields, data)` 函数
+- 根据 fields 元数据校验写入的数据：
+
+| 校验项 | 来源字段 | 校验逻辑 |
+|---|---|---|
+| 必填校验 | `isRequired` | 没传这个字段就报错 |
+| 长度校验 | `lengthLimit` | 字符串超长就报错 |
+| 类型校验 | `fieldType` | number 传了字符串就报错 |
+| 正则校验 | `regex` | 配置了正则就用正则校验 |
+| 唯一校验 | `isUnique` | 重复值就报错（要查数据库） |
+
+**为什么做：** 元数据里配了这些约束，写入时必须在服务端校验，不能只靠前端。
+
+---
+
+### 任务4：动态CRUD路由
+
+**新建文件：`src/routes/data.ts`**
+
+路由挂载在：`/api/projects/:projectId/tables/:tableName/data`
+
+接口列表：
+- `GET /list` — 分页查询列表（带 where/sort/page/size）
+- `GET /:id` — 单条详情
+- `POST /create` — 新增一条
+- `PUT /:id` — 更新一条
+- `DELETE /:id` — 删除一条
+
+每个接口的流程：
+1. `loadProject` — 检查项目存在且启用（复用 tables.ts 里的逻辑）
+2. 查元数据 — 根据 tableName 查表定义和字段列表
+3. 连业务数据库 — 调 `getDbClient(projectId)`
+4. 校验/解析 — 写入前过 validator，查询前过 queryParser
+5. 执行操作 — 用 raw SQL 操作业务表
+6. 返回结果 — 用统一响应包装
+
+**为什么做：** 这是阶段二的核心产出——给定表名，自动就能做CRUD，不用手写每个表的接口。
+
+---
+
+### 任务5：手动建测试表
+
+要做什么：
+- 在业务数据库里手动建一张测试表（比如 `album`）
+- 字段：id（自增主键）、name（文本）、type（文本）、created_at（时间戳）
+- 在元数据里注册这张表和它的字段
+
+**为什么做：** 阶段二不做DDL引擎（那是阶段三的事），所以表要手动建。建好了才能测动态CRUD引擎。
+
+---
+
+### 阶段二工程决策（已拍板）
+
+#### 业务数据库选择
+
+同一个 PG 实例里建两个 database：
+- `schemaflow_meta` — 存元数据（项目/表/字段定义）
+- `schemaflow_biz` — 存业务数据（用户配置的业务表）
+
+同一个 Docker 容器，逻辑上分离，干净且不用额外起容器。
+
+---
+
+#### 主键字段：动态读元数据
+
+路由里的 `:id` 路径参数，实际 WHERE 用哪个列，由元数据决定——查 `isPrimary=true` 的 fieldKey。
+
+理由：`primaryKeyStrategy` 字段设计了就是为了支持不同主键，硬编码 `id` 就白设计了。
+
+---
+
+#### where 查询参数格式
+
+JSON 格式，query string 里传：
+```
+?where={"name":{"op":"like","value":"周"},"age":{"op":"gte","value":18}}
+```
+
+支持操作符：`=`, `>`, `<`, `>=`, `<=`, `!=`, `like`
+
+理由：JSON最灵活，前端好构造，解析器好写，后续扩展嵌套条件也方便。
+
+---
+
+#### list 响应格式
+
+```json
+{
+  "code": 0,
+  "message": "ok",
+  "data": {
+    "list": [...],
+    "total": 123,
+    "page": 1,
+    "size": 20
+  }
+}
+```
+
+带 total，前端要画分页器。
+
+---
+
+#### PUT 语义：部分更新
+
+只传要改的字段，没传的不动。虽然HTTP语义上PUT是全量替换，但实际开发中大家都这么用。
+
+---
+
+#### create 请求体：扁平结构
+
+```json
+{"name":"稻香","type":"流行"}
+```
+
+直接对应一行数据，少一层包装。
+
+---
+
+#### SQL 注入防护
+
+- 表名/列名从元数据来（可信），但 where/sort 里用户传的字段名必须做白名单校验（只允许元数据里注册过的 fieldKey）
+- 值必须参数化（`$1, $2...`），绝对不拼接
+
+---
+
+#### isUnique 校验策略
+
+不主动查 DB 做唯一校验，直接靠数据库唯一索引报错，捕获后转成友好提示。
+
+理由：少一次 SELECT，而且不会有并发漏洞。
+
+---
+
+### 阶段二的边界（不做什么）
+
+| 不做的事 | 原因 |
+|---|---|
+| 自动建表/改表结构 | 阶段三 DDL 引擎的事 |
+| 正式的行权限过滤 | 阶段五的事，阶段二先预留钩子 |
+| 多DB适配（Mongo/ES） | 阶段四只做 PostgreSQL |
+| 批量操作 | 阶段二只做单条CRUD，批量后续再加 |
+| 事务 | 阶段二单条操作，不需要 |
+
+---
+
+### 阶段二验收标准
+
+1. 连上业务数据库，能根据表名查询数据列表（带分页、排序、条件过滤）
+2. 能新增、修改、删除单条数据
+3. 写入时自动做字段校验（必填、长度、类型），校验不通过返回明确错误
+4. 响应格式统一为 `{ code, message, data }`
+5. 不带 ADMIN_TOKEN 请求返回 401
+6. 写操作打审计日志到 stdout
 
 ---
 
