@@ -64,6 +64,15 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     if (!body.isPrimary && body.primaryKeyStrategy) {
       return fail(res, 400, 'non-primary field must not set primaryKeyStrategy')
     }
+    // 一表一主键：设为主键前检查表是否已有主键
+    if (body.isPrimary) {
+      const existingPk = await prisma.field.findFirst({
+        where: { tableId: table.id, isPrimary: true },
+      })
+      if (existingPk) {
+        return fail(res, 400, `table already has primary key "${existingPk.fieldKey}"`)
+      }
+    }
 
     const field = await prisma.field.create({
       data: {
@@ -122,10 +131,18 @@ router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction)
     if (!nextIsPrimary && nextStrategy) {
       return fail(res, 400, 'non-primary field must not set primaryKeyStrategy')
     }
+    // 一表一主键：改成主键前检查是否已有其他主键
+    if (nextIsPrimary && !existing.isPrimary) {
+      const existingPk = await prisma.field.findFirst({
+        where: { tableId: table.id, isPrimary: true, NOT: { id: existing.id } },
+      })
+      if (existingPk) {
+        return fail(res, 400, `table already has primary key "${existingPk.fieldKey}"`)
+      }
+    }
 
     const data: any = {
       displayName: body.displayName ?? existing.displayName,
-      fieldType: body.fieldType ?? existing.fieldType,
       isPrimary: nextIsPrimary,
       primaryKeyStrategy: nextStrategy,
       isRequired: body.isRequired ?? existing.isRequired,

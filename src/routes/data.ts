@@ -4,7 +4,7 @@ import { prisma } from '../prisma.js'
 import { getDbClient } from '../services/dbConnection.js'
 import { parseQuery, buildWhereSql, buildOrderBySql } from '../services/queryParser.js'
 import { validateData } from '../services/validator.js'
-import { audit } from '../utils/audit.js'
+import { audit, maskRow } from '../utils/audit.js'
 import { ok, created, fail } from '../utils/respond.js'
 
 import type { Request, Response, NextFunction, Router } from 'express'
@@ -62,7 +62,7 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
     }
     const { where, sort, page, size } = parsed
 
-    const whereBuilt = buildWhereSql(where)
+    const whereBuilt = buildWhereSql(where, ctx.fields)
     const orderSql = buildOrderBySql(sort)
     const offset = (page - 1) * size
 
@@ -120,6 +120,25 @@ router.post('/create', async (req: Request, res: Response, next: NextFunction) =
       if (allowedKeys.has(k)) safeData[k] = data[k]
     }
 
+    // 只读字段不允许写入，传了就报错
+    const readonlyFields = ctx.fields.filter((f) => f.isReadonly).map((f) => f.fieldKey)
+    const attemptedReadonly = Object.keys(safeData).filter((k) => readonlyFields.includes(k))
+    if (attemptedReadonly.length > 0) {
+      return fail(res, 400, `cannot write to readonly field(s): ${attemptedReadonly.join(', ')}`)
+    }
+
+    // 注入 defaultValue（create 时用户没传的字段），按 fieldType 转类型
+    for (const f of ctx.fields) {
+      if (safeData[f.fieldKey] === undefined && f.defaultValue !== null) {
+        safeData[f.fieldKey] = coerceValue(f.fieldType, f.defaultValue)
+      }
+    }
+
+    // uuid 主键自动生成
+    if (ctx.pkField.primaryKeyStrategy === 'uuid' && !safeData[ctx.pkField.fieldKey]) {
+      safeData[ctx.pkField.fieldKey] = crypto.randomUUID()
+    }
+
     const errors = validateData(ctx.fields, safeData, true)
     if (errors.length > 0) return fail(res, 400, 'validation failed', errors)
 
@@ -132,12 +151,15 @@ router.post('/create', async (req: Request, res: Response, next: NextFunction) =
 
     const sql = `INSERT INTO "${ctx.table.tableName}" (${columns}) VALUES (${placeholders}) RETURNING *`
     const r = await client_query(ctx, sql, values)
+    const passwordFields = new Set(
+      ctx.fields.filter((f) => f.fieldType === 'password').map((f) => f.fieldKey),
+    )
     audit({
       action: 'data.create',
       projectId: ctx.project.projectId,
       tableName: ctx.table.tableName,
       operator: (req as any).operator,
-      after: r.rows[0],
+      after: maskRow(r.rows[0], passwordFields),
     })
     return created(res, r.rows[0])
   } catch (e: any) {
@@ -165,6 +187,13 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
       if (allowedKeys.has(k)) safeData[k] = data[k]
     }
 
+    // 只读字段不允许写入
+    const readonlyFields = ctx.fields.filter((f) => f.isReadonly).map((f) => f.fieldKey)
+    const attemptedReadonly = Object.keys(safeData).filter((k) => readonlyFields.includes(k))
+    if (attemptedReadonly.length > 0) {
+      return fail(res, 400, `cannot write to readonly field(s): ${attemptedReadonly.join(', ')}`)
+    }
+
     if (Object.keys(safeData).length === 0) return fail(res, 400, 'no fields to update')
 
     const errors = validateData(ctx.fields, safeData, false)
@@ -175,16 +204,24 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
     const values = keys.map((k) => safeData[k])
     const pkParam = values.length + 1
 
+    // 先查旧值做审计 before
+    const beforeSql = `SELECT * FROM "${ctx.table.tableName}" WHERE "${ctx.pkField.fieldKey}" = $1`
+    const beforeRes = await client_query(ctx, beforeSql, [req.params.id])
+    if (beforeRes.rows.length === 0) return fail(res, 404, 'record not found')
+
     const sql = `UPDATE "${ctx.table.tableName}" SET ${setClause} WHERE "${ctx.pkField.fieldKey}" = $${pkParam} RETURNING *`
     const r = await client_query(ctx, sql, [...values, req.params.id])
-    if (r.rows.length === 0) return fail(res, 404, 'record not found')
 
+    const passwordFields = new Set(
+      ctx.fields.filter((f) => f.fieldType === 'password').map((f) => f.fieldKey),
+    )
     audit({
       action: 'data.update',
       projectId: ctx.project.projectId,
       tableName: ctx.table.tableName,
       operator: (req as any).operator,
-      after: r.rows[0],
+      before: maskRow(beforeRes.rows[0], passwordFields),
+      after: maskRow(r.rows[0], passwordFields),
     })
     return ok(res, r.rows[0])
   } catch (e: any) {
@@ -205,12 +242,15 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
     const r = await client_query(ctx, sql, [req.params.id])
     if (r.rows.length === 0) return fail(res, 404, 'record not found')
 
+    const passwordFields = new Set(
+      ctx.fields.filter((f) => f.fieldType === 'password').map((f) => f.fieldKey),
+    )
     audit({
       action: 'data.delete',
       projectId: ctx.project.projectId,
       tableName: ctx.table.tableName,
       operator: (req as any).operator,
-      before: r.rows[0],
+      before: maskRow(r.rows[0], passwordFields),
     })
     return ok(res, { deleted: r.rows[0] })
   } catch (e) {
@@ -226,6 +266,24 @@ async function client_query(
 ) {
   const client = await getDbClient(ctx.project.projectId)
   return client.query(sql, params)
+}
+
+// defaultValue 在 DB 里是 VARCHAR，按 fieldType 转成 JS 原生类型
+function coerceValue(fieldType: string, value: string): unknown {
+  switch (fieldType) {
+    case 'number':
+      return Number(value)
+    case 'boolean':
+      return value === 'true'
+    case 'json':
+      try {
+        return JSON.parse(value)
+      } catch {
+        return value
+      }
+    default:
+      return value
+  }
 }
 
 export default router

@@ -79,11 +79,38 @@ export function parseQuery(
 }
 
 /**
+ * 按 fieldType 决定参数的 PG cast。
+ * 历史背景：阶段二开发时遇 PG 42P18 参数类型推断失败，
+ * 曾临时对所有列和参数做 ::text cast，导致数字/日期区间查询
+ * 退化为字符串字典序比较。现按 fieldType 精确 cast。
+ */
+function paramCast(fieldType: string): string {
+  switch (fieldType) {
+    case 'number':
+      return '::numeric'
+    case 'date':
+    case 'datetime':
+      return '::timestamptz'
+    default:
+      // text / select / multiselect / richtext / password / email / url
+      return '::text'
+  }
+}
+
+/**
+ * escape like pattern 里的 % _ \ 通配符
+ */
+function escapeLikePattern(value: string): string {
+  return value.replace(/[%_\\]/g, '\\$&')
+}
+
+/**
  * 把 where 条件转成 SQL 片段和参数数组。
- * 返回的 SQL 片段用 $1/$2 占位符。
+ * 需要 metaFields 来按 fieldType 决定 cast。
  */
 export function buildWhereSql(
   where: WhereCond[],
+  metaFields: Pick<Field, 'fieldKey' | 'fieldType'>[],
   startParamIndex = 1,
 ): {
   sql: string
@@ -92,40 +119,42 @@ export function buildWhereSql(
 } {
   if (where.length === 0) return { sql: '', params: [], nextIndex: startParamIndex }
 
+  const fieldTypeMap = new Map(metaFields.map((f) => [f.fieldKey, f.fieldType]))
   const clauses: string[] = []
   const params: unknown[] = []
   let i = startParamIndex
 
   for (const cond of where) {
-    const safeField = `"${cond.field}"::text`
+    const safeField = `"${cond.field}"`
+    const cast = paramCast(fieldTypeMap.get(cond.field) ?? 'text')
     switch (cond.op) {
       case '=':
-        clauses.push(`${safeField} = $${i++}::text`)
+        clauses.push(`${safeField} = $${i++}${cast}`)
         params.push(String(cond.value))
         break
       case '!=':
-        clauses.push(`${safeField} != $${i++}::text`)
+        clauses.push(`${safeField} != $${i++}${cast}`)
         params.push(String(cond.value))
         break
       case '>':
-        clauses.push(`${safeField} > $${i++}::text`)
+        clauses.push(`${safeField} > $${i++}${cast}`)
         params.push(String(cond.value))
         break
       case '<':
-        clauses.push(`${safeField} < $${i++}::text`)
+        clauses.push(`${safeField} < $${i++}${cast}`)
         params.push(String(cond.value))
         break
       case '>=':
-        clauses.push(`${safeField} >= $${i++}::text`)
+        clauses.push(`${safeField} >= $${i++}${cast}`)
         params.push(String(cond.value))
         break
       case '<=':
-        clauses.push(`${safeField} <= $${i++}::text`)
+        clauses.push(`${safeField} <= $${i++}${cast}`)
         params.push(String(cond.value))
         break
       case 'like':
-        clauses.push(`${safeField} LIKE $${i++}::text`)
-        params.push(`%${String(cond.value)}%`)
+        clauses.push(`${safeField} LIKE $${i++}${cast} ESCAPE '\\'`)
+        params.push(`%${escapeLikePattern(String(cond.value))}%`)
         break
     }
   }

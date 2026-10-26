@@ -5,7 +5,7 @@ import { prisma } from '../prisma.js'
 import { createProjectSchema, updateProjectSchema } from '../schemas.js'
 import { serializeDbConfig, deserializeDbConfig } from '../services/dbConfig.js'
 import { closeDbClient } from '../services/dbConnection.js'
-import { audit } from '../utils/audit.js'
+import { audit, maskDbConfig } from '../utils/audit.js'
 import { ok, created, fail } from '../utils/respond.js'
 
 const router = Router()
@@ -40,7 +40,12 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         dbConfig: serializeDbConfig(body.dbConfig),
       },
     })
-    audit({ action: 'project.create', projectId, operator: (req as any).operator, after: project })
+    audit({
+      action: 'project.create',
+      projectId,
+      operator: (req as any).operator,
+      after: maskDbConfig(project),
+    })
     return created(res, { ...project, dbConfig: deserializeDbConfig(project.dbConfig) })
   } catch (e) {
     next(e)
@@ -89,8 +94,8 @@ router.put('/:projectId', async (req: Request, res: Response, next: NextFunction
       action: 'project.update',
       projectId: req.params.projectId as string,
       operator: (req as any).operator,
-      before: existing,
-      after: updated,
+      before: maskDbConfig(existing),
+      after: maskDbConfig(updated),
     })
     return ok(res, { ...updated, dbConfig: deserializeDbConfig(updated.dbConfig) })
   } catch (e) {
