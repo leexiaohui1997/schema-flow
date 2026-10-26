@@ -1,18 +1,8 @@
 import { describe, it, expect } from 'vitest'
 
-import {
-  mapFieldTypeToPgColumn,
-  generateCreateTableSql,
-  generateAddColumnSql,
-  generateAddPkColumnSql,
-  generateDropColumnSql,
-  generateAddPkConstraintSql,
-  generateSetNotNullSql,
-  generateDropNotNullSql,
-  generateCreateUniqueIndexSql,
-  generateDropUniqueIndexSql,
-  generateMtimeTriggerSql,
-} from '../src/services/ddlGenerator.js'
+import { mapFieldTypeToPgColumn, PgDdlGenerator } from '../src/services/pgDdlGenerator.js'
+
+const gen = new PgDdlGenerator()
 
 describe('mapFieldTypeToPgColumn', () => {
   it('text 有 lengthLimit → VARCHAR(n)', () => {
@@ -40,7 +30,7 @@ describe('mapFieldTypeToPgColumn', () => {
 
 describe('generateCreateTableSql', () => {
   it('主键 auto_increment → SERIAL PRIMARY KEY', () => {
-    const sql = generateCreateTableSql('album', [
+    const sql = gen.generateCreateTableSql('album', [
       {
         fieldKey: 'id',
         fieldType: 'number',
@@ -54,14 +44,14 @@ describe('generateCreateTableSql', () => {
   })
 
   it('主键 uuid → UUID PRIMARY KEY DEFAULT gen_random_uuid()', () => {
-    const sql = generateCreateTableSql('users', [
+    const sql = gen.generateCreateTableSql('users', [
       { fieldKey: 'uid', fieldType: 'uuid', isPrimary: true, primaryKeyStrategy: 'uuid' },
     ])
     expect(sql).toContain('"uid" UUID PRIMARY KEY DEFAULT gen_random_uuid()')
   })
 
   it('普通列 NOT NULL', () => {
-    const sql = generateCreateTableSql('album', [
+    const sql = gen.generateCreateTableSql('album', [
       {
         fieldKey: 'id',
         fieldType: 'number',
@@ -74,13 +64,13 @@ describe('generateCreateTableSql', () => {
   })
 
   it('没主键时也建表', () => {
-    const sql = generateCreateTableSql('album', [{ fieldKey: 'name', fieldType: 'text' }])
+    const sql = gen.generateCreateTableSql('album', [{ fieldKey: 'name', fieldType: 'text' }])
     expect(sql).toContain('CREATE TABLE "album"')
     expect(sql).not.toContain('PRIMARY KEY')
   })
 
   it('custom 策略作为首字段，CREATE TABLE 带 PRIMARY KEY', () => {
-    const sql = generateCreateTableSql('users', [
+    const sql = gen.generateCreateTableSql('users', [
       {
         fieldKey: 'uid',
         fieldType: 'text',
@@ -95,18 +85,18 @@ describe('generateCreateTableSql', () => {
 
 describe('generateAddColumnSql', () => {
   it('ADD COLUMN', () => {
-    const sql = generateAddColumnSql('album', { fieldKey: 'genre', fieldType: 'text' })
+    const sql = gen.generateAddColumnSql('album', { fieldKey: 'genre', fieldType: 'text' })
     expect(sql).toBe('ALTER TABLE "album" ADD COLUMN "genre" TEXT')
   })
 })
 
 describe('generateDropColumnSql', () => {
   it('普通字段 DROP COLUMN', () => {
-    const stmts = generateDropColumnSql('album', { fieldKey: 'genre', fieldType: 'text' })
+    const stmts = gen.generateDropColumnSql('album', { fieldKey: 'genre', fieldType: 'text' })
     expect(stmts).toEqual(['ALTER TABLE "album" DROP COLUMN "genre"'])
   })
   it('主键字段先 DROP CONSTRAINT', () => {
-    const stmts = generateDropColumnSql('album', {
+    const stmts = gen.generateDropColumnSql('album', {
       fieldKey: 'id',
       fieldType: 'number',
       isPrimary: true,
@@ -118,32 +108,25 @@ describe('generateDropColumnSql', () => {
   })
 })
 
-describe('generateAddPkConstraintSql', () => {
-  it('ADD PRIMARY KEY', () => {
-    const sql = generateAddPkConstraintSql('album', { fieldKey: 'id', fieldType: 'number' })
-    expect(sql).toBe('ALTER TABLE "album" ADD PRIMARY KEY ("id")')
-  })
-})
-
 describe('unique index', () => {
   it('CREATE UNIQUE INDEX', () => {
-    const sql = generateCreateUniqueIndexSql('users', { fieldKey: 'email', fieldType: 'email' })
+    const sql = gen.generateCreateUniqueIndexSql('users', { fieldKey: 'email', fieldType: 'email' })
     expect(sql).toBe('CREATE UNIQUE INDEX "users_email_key" ON "users" ("email")')
   })
   it('DROP INDEX', () => {
-    const sql = generateDropUniqueIndexSql('users', { fieldKey: 'email', fieldType: 'email' })
+    const sql = gen.generateDropUniqueIndexSql('users', { fieldKey: 'email', fieldType: 'email' })
     expect(sql).toBe('DROP INDEX IF EXISTS "users_email_key"')
   })
 })
 
 describe('not null', () => {
   it('SET NOT NULL', () => {
-    expect(generateSetNotNullSql('album', { fieldKey: 'name', fieldType: 'text' })).toBe(
+    expect(gen.generateSetNotNullSql('album', { fieldKey: 'name', fieldType: 'text' })).toBe(
       'ALTER TABLE "album" ALTER COLUMN "name" SET NOT NULL',
     )
   })
   it('DROP NOT NULL', () => {
-    expect(generateDropNotNullSql('album', { fieldKey: 'name', fieldType: 'text' })).toBe(
+    expect(gen.generateDropNotNullSql('album', { fieldKey: 'name', fieldType: 'text' })).toBe(
       'ALTER TABLE "album" ALTER COLUMN "name" DROP NOT NULL',
     )
   })
@@ -151,7 +134,7 @@ describe('not null', () => {
 
 describe('generateAddPkColumnSql', () => {
   it('auto_increment 策略：ADD COLUMN SERIAL + ADD PK', () => {
-    const stmts = generateAddPkColumnSql('album', {
+    const stmts = gen.generateAddPkColumnSql('album', {
       fieldKey: 'id',
       fieldType: 'number',
       isPrimary: true,
@@ -163,7 +146,7 @@ describe('generateAddPkColumnSql', () => {
     ])
   })
   it('uuid 策略：ADD COLUMN UUID DEFAULT + ADD PK', () => {
-    const stmts = generateAddPkColumnSql('users', {
+    const stmts = gen.generateAddPkColumnSql('users', {
       fieldKey: 'uid',
       fieldType: 'uuid',
       isPrimary: true,
@@ -175,7 +158,7 @@ describe('generateAddPkColumnSql', () => {
     ])
   })
   it('custom 策略：ADD COLUMN 普通类型 + ADD PK', () => {
-    const stmts = generateAddPkColumnSql('users', {
+    const stmts = gen.generateAddPkColumnSql('users', {
       fieldKey: 'uid',
       fieldType: 'text',
       isPrimary: true,
@@ -191,7 +174,7 @@ describe('generateAddPkColumnSql', () => {
 
 describe('generateMtimeTriggerSql', () => {
   it('生成 trigger 函数和 trigger', () => {
-    const stmts = generateMtimeTriggerSql('album')
+    const stmts = gen.generateMtimeTriggerSql('album')
     expect(stmts.length).toBe(2)
     expect(stmts[0]).toContain('CREATE OR REPLACE FUNCTION "update_album_mtime"()')
     expect(stmts[1]).toContain('CREATE TRIGGER "album_update_mtime"')

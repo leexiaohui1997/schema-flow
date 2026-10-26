@@ -1,15 +1,26 @@
 import { Router as createRouter } from 'express'
 
 import { prisma } from '../prisma.js'
+import { deserializeDbConfig } from '../services/dbConfig.js'
 import { getDbClient } from '../services/dbConnection.js'
-import { parseQuery, buildWhereSql, buildOrderBySql } from '../services/queryParser.js'
+import { MysqlQueryBuilder } from '../services/mysqlQueryBuilder.js'
+import { PgQueryBuilder } from '../services/pgQueryBuilder.js'
+import { parseQuery } from '../services/queryParser.js'
 import { validateData } from '../services/validator.js'
 import { audit, maskRow } from '../utils/audit.js'
 import { ok, created, fail } from '../utils/respond.js'
 
+import type { QueryBuilder } from '../services/queryBuilder.js'
 import type { Request, Response, NextFunction, Router } from 'express'
 
 const router: Router = createRouter({ mergeParams: true })
+
+/** 根据项目的 dbConfig 选 QueryBuilder */
+function getQueryBuilder(dbConfig: any): QueryBuilder {
+  const cfg = deserializeDbConfig(dbConfig) as { dbType?: string }
+  const dbType = cfg.dbType ?? 'postgres'
+  return dbType === 'mysql' ? new MysqlQueryBuilder() : new PgQueryBuilder()
+}
 
 // 加载项目 + 表元数据 + 字段元数据
 async function loadContext(req: Request, res: Response) {
@@ -45,7 +56,7 @@ async function loadContext(req: Request, res: Response) {
     return null
   }
 
-  return { project, table, fields, pkField }
+  return { project, table, fields, pkField, qb: getQueryBuilder(project.dbConfig) }
 }
 
 // GET /list
@@ -53,6 +64,7 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const ctx = await loadContext(req, res)
     if (!ctx) return
+    const { qb } = ctx
 
     let parsed
     try {
@@ -62,24 +74,22 @@ router.get('/list', async (req: Request, res: Response, next: NextFunction) => {
     }
     const { where, sort, page, size } = parsed
 
-    const whereBuilt = buildWhereSql(where, ctx.fields)
-    const orderSql = buildOrderBySql(sort)
-    const offset = (page - 1) * size
+    const whereBuilt = qb.buildWhereSql(where, ctx.fields)
+    const orderSql = qb.buildOrderBySql(sort)
+    const limitSql = qb.buildLimitOffsetSql(page, size)
 
     // COUNT
-    const countSql = whereBuilt.sql
-      ? `SELECT COUNT(*)::int AS total FROM "${ctx.table.tableName}" WHERE ${whereBuilt.sql}`
-      : `SELECT COUNT(*)::int AS total FROM "${ctx.table.tableName}"`
+    const countSql = qb.buildCountSql(ctx.table.tableName, whereBuilt.sql)
     const countRes = await client_query(ctx, countSql, whereBuilt.params)
     const total = countRes.rows[0].total as number
 
     // SELECT
     const whereClause = whereBuilt.sql ? `WHERE ${whereBuilt.sql}` : ''
-    const selectSql = `SELECT * FROM "${ctx.table.tableName}"
+    const selectSql = `SELECT * FROM ${qb.quote(ctx.table.tableName)}
       ${whereClause}
       ${orderSql ? orderSql + ' ' : ''}
-      LIMIT $${whereBuilt.nextIndex} OFFSET $${whereBuilt.nextIndex + 1}`
-    const listRes = await client_query(ctx, selectSql, [...whereBuilt.params, size, offset])
+      ${limitSql}`
+    const listRes = await client_query(ctx, selectSql, whereBuilt.params)
 
     return ok(res, { list: listRes.rows, total, page, size })
   } catch (e) {
@@ -92,8 +102,9 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const ctx = await loadContext(req, res)
     if (!ctx) return
+    const { qb } = ctx
 
-    const sql = `SELECT * FROM "${ctx.table.tableName}" WHERE "${ctx.pkField.fieldKey}" = $1 LIMIT 1`
+    const sql = `SELECT * FROM ${qb.quote(ctx.table.tableName)} WHERE ${qb.quote(ctx.pkField.fieldKey)} = ? LIMIT 1`
     const r = await client_query(ctx, sql, [req.params.id])
     if (r.rows.length === 0) return fail(res, 404, 'record not found')
     return ok(res, r.rows[0])
@@ -107,6 +118,7 @@ router.post('/create', async (req: Request, res: Response, next: NextFunction) =
   try {
     const ctx = await loadContext(req, res)
     if (!ctx) return
+    const { qb } = ctx
 
     const data = req.body as Record<string, unknown>
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -145,12 +157,20 @@ router.post('/create', async (req: Request, res: Response, next: NextFunction) =
     const keys = Object.keys(safeData)
     if (keys.length === 0) return fail(res, 400, 'no fields to insert')
 
-    const columns = keys.map((k) => `"${k}"`).join(', ')
-    const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ')
+    const placeholders = keys.map(() => '?')
     const values = keys.map((k) => safeData[k])
 
-    const sql = `INSERT INTO "${ctx.table.tableName}" (${columns}) VALUES (${placeholders}) RETURNING *`
-    const r = await client_query(ctx, sql, values)
+    const sql = qb.buildInsertSql(ctx.table.tableName, keys, placeholders)
+    await client_query(ctx, sql, values)
+
+    // MySQL 没有 RETURNING，插入后再查
+    const insertId = await getLastInsertId(ctx, qb)
+    const r = await client_query(
+      ctx,
+      `SELECT * FROM ${qb.quote(ctx.table.tableName)} WHERE ${qb.quote(ctx.pkField.fieldKey)} = ? LIMIT 1`,
+      [insertId ?? safeData[ctx.pkField.fieldKey]],
+    )
+
     const passwordFields = new Set(
       ctx.fields.filter((f) => f.fieldType === 'password').map((f) => f.fieldKey),
     )
@@ -163,7 +183,7 @@ router.post('/create', async (req: Request, res: Response, next: NextFunction) =
     })
     return created(res, r.rows[0])
   } catch (e: any) {
-    if (e.code === '23505') {
+    if (e.code === '23505' || e.errno === 1062 || e.code === 'ER_DUP_ENTRY') {
       return fail(res, 409, `unique constraint violation: ${e.detail || e.message}`)
     }
     next(e)
@@ -175,6 +195,7 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const ctx = await loadContext(req, res)
     if (!ctx) return
+    const { qb } = ctx
 
     const data = req.body as Record<string, unknown>
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -200,17 +221,24 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
     if (errors.length > 0) return fail(res, 400, 'validation failed', errors)
 
     const keys = Object.keys(safeData)
-    const setClause = keys.map((k, i) => `"${k}" = $${i + 1}`).join(', ')
+    const setClause = keys.map((k) => `${qb.quote(k)} = ?`).join(', ')
     const values = keys.map((k) => safeData[k])
-    const pkParam = values.length + 1
 
     // 先查旧值做审计 before
-    const beforeSql = `SELECT * FROM "${ctx.table.tableName}" WHERE "${ctx.pkField.fieldKey}" = $1`
+    const beforeSql = `SELECT * FROM ${qb.quote(ctx.table.tableName)} WHERE ${qb.quote(ctx.pkField.fieldKey)} = ?`
     const beforeRes = await client_query(ctx, beforeSql, [req.params.id])
     if (beforeRes.rows.length === 0) return fail(res, 404, 'record not found')
 
-    const sql = `UPDATE "${ctx.table.tableName}" SET ${setClause} WHERE "${ctx.pkField.fieldKey}" = $${pkParam} RETURNING *`
-    const r = await client_query(ctx, sql, [...values, req.params.id])
+    const sql = qb.buildUpdateSql(
+      ctx.table.tableName,
+      ctx.pkField.fieldKey,
+      setClause,
+      values.length + 1,
+    )
+    await client_query(ctx, sql, [...values, req.params.id])
+
+    // 更新后再查
+    const r = await client_query(ctx, beforeSql, [req.params.id])
 
     const passwordFields = new Set(
       ctx.fields.filter((f) => f.fieldType === 'password').map((f) => f.fieldKey),
@@ -225,7 +253,7 @@ router.put('/:id', async (req: Request, res: Response, next: NextFunction) => {
     })
     return ok(res, r.rows[0])
   } catch (e: any) {
-    if (e.code === '23505') {
+    if (e.code === '23505' || e.errno === 1062 || e.code === 'ER_DUP_ENTRY') {
       return fail(res, 409, `unique constraint violation: ${e.detail || e.message}`)
     }
     next(e)
@@ -237,10 +265,15 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
   try {
     const ctx = await loadContext(req, res)
     if (!ctx) return
+    const { qb } = ctx
 
-    const sql = `DELETE FROM "${ctx.table.tableName}" WHERE "${ctx.pkField.fieldKey}" = $1 RETURNING *`
-    const r = await client_query(ctx, sql, [req.params.id])
-    if (r.rows.length === 0) return fail(res, 404, 'record not found')
+    // 先查要删的记录做审计 before
+    const beforeSql = `SELECT * FROM ${qb.quote(ctx.table.tableName)} WHERE ${qb.quote(ctx.pkField.fieldKey)} = ?`
+    const beforeRes = await client_query(ctx, beforeSql, [req.params.id])
+    if (beforeRes.rows.length === 0) return fail(res, 404, 'record not found')
+
+    const sql = qb.buildDeleteSql(ctx.table.tableName, ctx.pkField.fieldKey)
+    await client_query(ctx, sql, [req.params.id])
 
     const passwordFields = new Set(
       ctx.fields.filter((f) => f.fieldType === 'password').map((f) => f.fieldKey),
@@ -250,13 +283,28 @@ router.delete('/:id', async (req: Request, res: Response, next: NextFunction) =>
       projectId: ctx.project.projectId,
       tableName: ctx.table.tableName,
       operator: (req as any).operator,
-      before: maskRow(r.rows[0], passwordFields),
+      before: maskRow(beforeRes.rows[0], passwordFields),
     })
-    return ok(res, { deleted: r.rows[0] })
+    return ok(res, { deleted: beforeRes.rows[0] })
   } catch (e) {
     next(e)
   }
 })
+
+// MySQL 插入后拿 lastInsertId
+async function getLastInsertId(
+  ctx: NonNullable<Awaited<ReturnType<typeof loadContext>>>,
+  qb: QueryBuilder,
+): Promise<unknown | undefined> {
+  // PG 用 RETURNING 已经拿到了，这里只给 MySQL 用
+  // 先查一下刚插入的记录
+  const cfg = deserializeDbConfig(ctx.project.dbConfig) as { dbType?: string }
+  if (cfg.dbType !== 'mysql') return undefined
+  // MySQL 自动增长列，查最大 id
+  const sql = `SELECT MAX(${qb.quote(ctx.pkField.fieldKey)}) AS last_id FROM ${qb.quote(ctx.table.tableName)}`
+  const r = await client_query(ctx, sql, [])
+  return r.rows[0]?.last_id
+}
 
 // 小工具：拿 client 跑 query
 async function client_query(

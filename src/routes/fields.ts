@@ -3,23 +3,23 @@ import { Router, Request, Response, NextFunction } from 'express'
 
 import { prisma } from '../prisma.js'
 import { createFieldSchema, updateFieldSchema } from '../schemas.js'
+import { deserializeDbConfig } from '../services/dbConfig.js'
 import { executeDdl, shouldSkipDdl } from '../services/ddlExecutor.js'
-import {
-  generateCreateTableSql,
-  generateAddColumnSql,
-  generateAddPkColumnSql,
-  generateDropColumnSql,
-  generateSetNotNullSql,
-  generateDropNotNullSql,
-  generateCreateUniqueIndexSql,
-  generateDropUniqueIndexSql,
-  generateAlterColumnTypeSql,
-  generateMtimeTriggerSql,
-} from '../services/ddlGenerator.js'
+import { MysqlDdlGenerator } from '../services/mysqlDdlGenerator.js'
+import { PgDdlGenerator } from '../services/pgDdlGenerator.js'
 import { audit } from '../utils/audit.js'
 import { ok, created, fail } from '../utils/respond.js'
 
+import type { DdlGenerator } from '../services/ddlGenerator.js'
+
 const router = Router({ mergeParams: true })
+
+/** 根据项目的 dbConfig 选 DDL 生成器 */
+function getDdlGenerator(dbConfig: any): DdlGenerator {
+  const cfg = deserializeDbConfig(dbConfig) as { dbType?: string }
+  const dbType = cfg.dbType ?? 'postgres'
+  return dbType === 'mysql' ? new MysqlDdlGenerator() : new PgDdlGenerator()
+}
 
 async function loadTable(req: Request, res: Response) {
   const project = await prisma.project.findUnique({
@@ -45,15 +45,17 @@ async function loadTable(req: Request, res: Response) {
     fail(res, 404, 'table not found')
     return null
   }
-  return table
+  return { project, table }
 }
 
-// 把 PG 错误转成友好提示
-function handlePgError(e: any, res: Response): boolean {
-  if (e.code === '23505') {
+// 把 DB 错误转成友好提示
+function handleDbError(e: any, res: Response): boolean {
+  // PG: 23505 unique violation, MySQL: 1062 ER_DUP_ENTRY
+  if (e.code === '23505' || e.errno === 1062 || e.code === 'ER_DUP_ENTRY') {
     fail(res, 409, '现有数据有重复，无法加唯一约束')
     return true
   }
+  // PG: 22001 string_data_length_mismatch
   if (e.code === '22001') {
     fail(res, 400, '现有数据超过新长度限制，无法缩窄')
     return true
@@ -64,8 +66,9 @@ function handlePgError(e: any, res: Response): boolean {
 // GET /api/projects/:projectId/tables/:tableName/fields
 router.get('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const table = await loadTable(req, res)
-    if (!table) return
+    const result = await loadTable(req, res)
+    if (!result) return
+    const { table } = result
     const list = await prisma.field.findMany({
       where: { tableId: table.id },
       orderBy: { sortOrder: 'asc' },
@@ -79,8 +82,9 @@ router.get('/', async (req: Request, res: Response, next: NextFunction) => {
 // POST /api/projects/:projectId/tables/:tableName/fields
 router.post('/', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const table = await loadTable(req, res)
-    if (!table) return
+    const result = await loadTable(req, res)
+    if (!result) return
+    const { project, table } = result
     const body = createFieldSchema.parse(req.body)
 
     // 主键一致性校验
@@ -103,14 +107,15 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     // 查这张表是不是第一个字段
     const fieldCount = await prisma.field.count({ where: { tableId: table.id } })
     const skipDdl = shouldSkipDdl(table.securityConfig)
+    const ddlGen = getDdlGenerator(project.dbConfig)
     const ddlStmts: string[] = []
 
     if (!skipDdl) {
       if (fieldCount === 0) {
         // 第一个字段：建表
-        const createSql = generateCreateTableSql(table.tableName, [body])
+        const createSql = ddlGen.generateCreateTableSql(table.tableName, [body])
         ddlStmts.push(createSql)
-        ddlStmts.push(...generateMtimeTriggerSql(table.tableName))
+        ddlStmts.push(...ddlGen.generateMtimeTriggerSql(table.tableName))
       } else {
         // 已有字段：ADD COLUMN
         // NOT NULL 字段必须有 defaultValue（PG 不允许 ADD COLUMN NOT NULL 不给默认值）
@@ -119,12 +124,12 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
         }
         if (body.isPrimary) {
           // 主键字段：按策略生成 SERIAL/UUID/custom 列 + PK 约束
-          ddlStmts.push(...generateAddPkColumnSql(table.tableName, body))
+          ddlStmts.push(...ddlGen.generateAddPkColumnSql(table.tableName, body))
         } else {
-          ddlStmts.push(generateAddColumnSql(table.tableName, body))
+          ddlStmts.push(ddlGen.generateAddColumnSql(table.tableName, body))
           // isUnique=true 加唯一索引
           if (body.isUnique) {
-            ddlStmts.push(generateCreateUniqueIndexSql(table.tableName, body))
+            ddlStmts.push(ddlGen.generateCreateUniqueIndexSql(table.tableName, body))
           }
         }
       }
@@ -134,7 +139,7 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     try {
       await executeDdl(req.params.projectId as string, ddlStmts)
     } catch (e: any) {
-      if (handlePgError(e, res)) return
+      if (handleDbError(e, res)) return
       throw e
     }
 
@@ -177,8 +182,9 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
 // PUT /api/projects/:projectId/tables/:tableName/fields/:fieldKey
 router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const table = await loadTable(req, res)
-    if (!table) return
+    const result = await loadTable(req, res)
+    if (!result) return
+    const { project, table } = result
     const body = updateFieldSchema.parse(req.body)
     const existing = await prisma.field.findUnique({
       where: { tableId_fieldKey: { tableId: table.id, fieldKey: req.params.fieldKey as string } },
@@ -207,6 +213,7 @@ router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction)
 
     // 对比新旧值，收集 DDL 语句
     const skipDdl = shouldSkipDdl(table.securityConfig)
+    const ddlGen = getDdlGenerator(project.dbConfig)
     const ddlStmts: string[] = []
 
     if (!skipDdl) {
@@ -218,25 +225,25 @@ router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction)
       // isRequired 变更
       if (nextIsRequired !== existing.isRequired) {
         if (nextIsRequired) {
-          ddlStmts.push(generateSetNotNullSql(table.tableName, existing))
+          ddlStmts.push(ddlGen.generateSetNotNullSql(table.tableName, existing))
         } else {
-          ddlStmts.push(generateDropNotNullSql(table.tableName, existing))
+          ddlStmts.push(ddlGen.generateDropNotNullSql(table.tableName, existing))
         }
       }
 
       // isUnique 变更
       if (nextIsUnique !== existing.isUnique) {
         if (nextIsUnique) {
-          ddlStmts.push(generateCreateUniqueIndexSql(table.tableName, existing))
+          ddlStmts.push(ddlGen.generateCreateUniqueIndexSql(table.tableName, existing))
         } else {
-          ddlStmts.push(generateDropUniqueIndexSql(table.tableName, existing))
+          ddlStmts.push(ddlGen.generateDropUniqueIndexSql(table.tableName, existing))
         }
       }
 
       // lengthLimit 变更
       if (nextLengthLimit !== existing.lengthLimit) {
         ddlStmts.push(
-          generateAlterColumnTypeSql(table.tableName, {
+          ddlGen.generateAlterColumnTypeSql(table.tableName, {
             ...existing,
             lengthLimit: nextLengthLimit,
           }),
@@ -248,7 +255,7 @@ router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction)
     try {
       await executeDdl(req.params.projectId as string, ddlStmts)
     } catch (e: any) {
-      if (handlePgError(e, res)) return
+      if (handleDbError(e, res)) return
       throw e
     }
 
@@ -290,8 +297,9 @@ router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction)
 // DELETE /api/projects/:projectId/tables/:tableName/fields/:fieldKey
 router.delete('/:fieldKey', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const table = await loadTable(req, res)
-    if (!table) return
+    const result = await loadTable(req, res)
+    if (!result) return
+    const { project, table } = result
     const existing = await prisma.field.findUnique({
       where: { tableId_fieldKey: { tableId: table.id, fieldKey: req.params.fieldKey as string } },
     })
@@ -300,11 +308,12 @@ router.delete('/:fieldKey', async (req: Request, res: Response, next: NextFuncti
     // 先执行 DDL，成功后再删元数据
     const skipDdl = shouldSkipDdl(table.securityConfig)
     if (!skipDdl) {
-      const ddlStmts = generateDropColumnSql(table.tableName, existing)
+      const ddlGen = getDdlGenerator(project.dbConfig)
+      const ddlStmts = ddlGen.generateDropColumnSql(table.tableName, existing)
       try {
         await executeDdl(req.params.projectId as string, ddlStmts)
       } catch (e: any) {
-        if (handlePgError(e, res)) return
+        if (handleDbError(e, res)) return
         throw e
       }
     }

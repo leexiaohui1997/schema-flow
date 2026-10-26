@@ -74,9 +74,21 @@ router.put('/:projectId', async (req: Request, res: Response, next: NextFunction
     })
     if (!existing) return fail(res, 404, 'project not found')
 
+    // dbType 创建后只读，不能改
+    if (body.dbType !== undefined && body.dbType !== existing.dbType) {
+      return fail(res, 400, 'dbType is read-only after project creation')
+    }
+    // dbConfig 里的 dbType 也不能改
+    if (body.dbConfig !== undefined) {
+      const oldDbConfig = deserializeDbConfig(existing.dbConfig) as { dbType?: string }
+      const newDbConfig = body.dbConfig as { dbType?: string }
+      if (oldDbConfig.dbType !== newDbConfig.dbType) {
+        return fail(res, 400, 'dbConfig.dbType is read-only after project creation')
+      }
+    }
+
     const data: any = {}
     if (body.name !== undefined) data.name = body.name
-    if (body.dbType !== undefined) data.dbType = body.dbType
     if (body.dbConfig !== undefined) data.dbConfig = serializeDbConfig(body.dbConfig)
     if (body.status !== undefined) data.status = body.status
 
