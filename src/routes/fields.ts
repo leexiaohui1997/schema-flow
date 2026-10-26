@@ -3,6 +3,19 @@ import { Router, Request, Response, NextFunction } from 'express'
 
 import { prisma } from '../prisma.js'
 import { createFieldSchema, updateFieldSchema } from '../schemas.js'
+import { executeDdl, shouldSkipDdl } from '../services/ddlExecutor.js'
+import {
+  generateCreateTableSql,
+  generateAddColumnSql,
+  generateAddPkColumnSql,
+  generateDropColumnSql,
+  generateSetNotNullSql,
+  generateDropNotNullSql,
+  generateCreateUniqueIndexSql,
+  generateDropUniqueIndexSql,
+  generateAlterColumnTypeSql,
+  generateMtimeTriggerSql,
+} from '../services/ddlGenerator.js'
 import { audit } from '../utils/audit.js'
 import { ok, created, fail } from '../utils/respond.js'
 
@@ -33,6 +46,19 @@ async function loadTable(req: Request, res: Response) {
     return null
   }
   return table
+}
+
+// 把 PG 错误转成友好提示
+function handlePgError(e: any, res: Response): boolean {
+  if (e.code === '23505') {
+    fail(res, 409, '现有数据有重复，无法加唯一约束')
+    return true
+  }
+  if (e.code === '22001') {
+    fail(res, 400, '现有数据超过新长度限制，无法缩窄')
+    return true
+  }
+  return false
 }
 
 // GET /api/projects/:projectId/tables/:tableName/fields
@@ -72,6 +98,44 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
       if (existingPk) {
         return fail(res, 400, `table already has primary key "${existingPk.fieldKey}"`)
       }
+    }
+
+    // 查这张表是不是第一个字段
+    const fieldCount = await prisma.field.count({ where: { tableId: table.id } })
+    const skipDdl = shouldSkipDdl(table.securityConfig)
+    const ddlStmts: string[] = []
+
+    if (!skipDdl) {
+      if (fieldCount === 0) {
+        // 第一个字段：建表
+        const createSql = generateCreateTableSql(table.tableName, [body])
+        ddlStmts.push(createSql)
+        ddlStmts.push(...generateMtimeTriggerSql(table.tableName))
+      } else {
+        // 已有字段：ADD COLUMN
+        // NOT NULL 字段必须有 defaultValue（PG 不允许 ADD COLUMN NOT NULL 不给默认值）
+        if (body.isRequired && body.defaultValue == null) {
+          return fail(res, 400, 'NOT NULL 字段必须提供 defaultValue，或允许 NULL')
+        }
+        if (body.isPrimary) {
+          // 主键字段：按策略生成 SERIAL/UUID/custom 列 + PK 约束
+          ddlStmts.push(...generateAddPkColumnSql(table.tableName, body))
+        } else {
+          ddlStmts.push(generateAddColumnSql(table.tableName, body))
+          // isUnique=true 加唯一索引
+          if (body.isUnique) {
+            ddlStmts.push(generateCreateUniqueIndexSql(table.tableName, body))
+          }
+        }
+      }
+    }
+
+    // 先执行 DDL，成功后再写元数据
+    try {
+      await executeDdl(req.params.projectId as string, ddlStmts)
+    } catch (e: any) {
+      if (handlePgError(e, res)) return
+      throw e
     }
 
     const field = await prisma.field.create({
@@ -141,6 +205,53 @@ router.put('/:fieldKey', async (req: Request, res: Response, next: NextFunction)
       }
     }
 
+    // 对比新旧值，收集 DDL 语句
+    const skipDdl = shouldSkipDdl(table.securityConfig)
+    const ddlStmts: string[] = []
+
+    if (!skipDdl) {
+      const nextIsRequired = body.isRequired ?? existing.isRequired
+      const nextIsUnique = body.isUnique ?? existing.isUnique
+      const nextLengthLimit =
+        body.lengthLimit !== undefined ? body.lengthLimit : existing.lengthLimit
+
+      // isRequired 变更
+      if (nextIsRequired !== existing.isRequired) {
+        if (nextIsRequired) {
+          ddlStmts.push(generateSetNotNullSql(table.tableName, existing))
+        } else {
+          ddlStmts.push(generateDropNotNullSql(table.tableName, existing))
+        }
+      }
+
+      // isUnique 变更
+      if (nextIsUnique !== existing.isUnique) {
+        if (nextIsUnique) {
+          ddlStmts.push(generateCreateUniqueIndexSql(table.tableName, existing))
+        } else {
+          ddlStmts.push(generateDropUniqueIndexSql(table.tableName, existing))
+        }
+      }
+
+      // lengthLimit 变更
+      if (nextLengthLimit !== existing.lengthLimit) {
+        ddlStmts.push(
+          generateAlterColumnTypeSql(table.tableName, {
+            ...existing,
+            lengthLimit: nextLengthLimit,
+          }),
+        )
+      }
+    }
+
+    // 先执行 DDL，成功后再更新元数据
+    try {
+      await executeDdl(req.params.projectId as string, ddlStmts)
+    } catch (e: any) {
+      if (handlePgError(e, res)) return
+      throw e
+    }
+
     const data: any = {
       displayName: body.displayName ?? existing.displayName,
       isPrimary: nextIsPrimary,
@@ -185,6 +296,19 @@ router.delete('/:fieldKey', async (req: Request, res: Response, next: NextFuncti
       where: { tableId_fieldKey: { tableId: table.id, fieldKey: req.params.fieldKey as string } },
     })
     if (!existing) return fail(res, 404, 'field not found')
+
+    // 先执行 DDL，成功后再删元数据
+    const skipDdl = shouldSkipDdl(table.securityConfig)
+    if (!skipDdl) {
+      const ddlStmts = generateDropColumnSql(table.tableName, existing)
+      try {
+        await executeDdl(req.params.projectId as string, ddlStmts)
+      } catch (e: any) {
+        if (handlePgError(e, res)) return
+        throw e
+      }
+    }
+
     await prisma.field.delete({ where: { id: existing.id } })
     audit({
       action: 'field.delete',

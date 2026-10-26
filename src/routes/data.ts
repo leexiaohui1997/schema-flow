@@ -41,7 +41,7 @@ async function loadContext(req: Request, res: Response) {
 
   const pkField = fields.find((f) => f.isPrimary)
   if (!pkField) {
-    fail(res, 500, `table "${tableName}" has no primary key defined in metadata`)
+    fail(res, 400, `table "${tableName}" is not ready: missing primary key field`)
     return null
   }
 
